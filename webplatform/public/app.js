@@ -520,9 +520,21 @@ function renderTL() {
     d.style.width = Math.max((b - a) / D * 100, .4) + "%";
     d.innerHTML = `<span>${esc(s.label || "")}</span>`;
     d.title = `${a.toFixed(1)}-${b.toFixed(1)}s ${s.label || ""}`;
-    d.onclick = (e) => { e.stopPropagation(); ED.sel = i; V().currentTime = a; renderRows(); };
+    d.onclick = (e) => { e.stopPropagation(); ED.sel = i; V().currentTime = a;
+      if (el("loopchk")?.checked) V().play();
+      renderRows(); };
     box.appendChild(d);
   });
+}
+function loopPlay(i) {
+  // called when a label textarea gets focus: select + loop that segment
+  ED.sel = i; const s = ED.segs[i]; const v = V();
+  if (!s || !v || !v.duration) return;
+  if (v.currentTime < s.start - 0.05 || v.currentTime >= s.end) v.currentTime = s.start;
+  if (el("loopchk")?.checked) v.play();
+  renderTL();   // highlight only - no row re-render, keeps the textarea focused
+  const li = el("loopinfo");
+  if (li) li.textContent = `segment ${i + 1} of ${ED.segs.length} selected`;
 }
 
 function renderRows() {
@@ -539,7 +551,9 @@ function renderRows() {
     const tr = document.createElement("tr");
     if (i === ED.sel) tr.style.background = "#eef0ff";
     tr.onclick = (e) => { if (!["TEXTAREA","INPUT","BUTTON"].includes(e.target.tagName)) {
-      ED.sel = i; V().currentTime = s.start; renderRows(); } };
+      ED.sel = i; V().currentTime = s.start;
+      if (el("loopchk")?.checked) V().play();
+      renderRows(); } };
     tr.innerHTML = `
       <td class="hint">${i + 1}</td>
       <td><input type="number" step="0.1" value="${s.start}" ${dis}
@@ -548,7 +562,7 @@ function renderRows() {
         onchange="updSeg(${i},'end',this.value)" style="width:72px">${step("end")}</td>
       <td style="color:#6b7280">${dur.toFixed(1)}s</td>
       <td><textarea ${dis} style="width:100%;min-height:34px;font-size:13px"
-        onfocus="ED.sel=${i}" oninput="ED.segs[${i}].label=this.value;liveWm(${i},this)"
+        onfocus="loopPlay(${i})" oninput="ED.segs[${i}].label=this.value;liveWm(${i},this)"
         onchange="updSeg(${i},'label',this.value)">${esc(s.label)}</textarea>
         <div style="font-size:11.5px;margin-top:2px">
           <span class="wm ${wcls}" id="wm${i}">${wc}/20 words</span>${issues.length ?
@@ -715,37 +729,72 @@ async function aiDraft() {
 }
 
 async function callClaude(cfg, sheets, duration, hint) {
+  const imgs = sheets.map((s) => ({ type: "image", source: {
+    type: "base64", media_type: "image/jpeg", data: s } }));
+
+  async function ask(text, maxTokens) {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": cfg.key,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({ model: cfg.model, max_tokens: maxTokens,
+        messages: [{ role: "user", content: [{ type: "text", text }, ...imgs] }] }),
+    });
+    if (!r.ok) {
+      let msg = "";
+      try { msg = (await r.json())?.error?.message || ""; } catch {}
+      throw new Error("Claude API error " + r.status + (msg ? ": " + msg.slice(0, 200) : ""));
+    }
+    const data = await r.json();
+    return (data.content || []).map((p) => p.text || "").join("");
+  }
+
+  // ---- PASS 1: review the ENTIRE video first - objects, phases, hands
+  el("msg").textContent =
+    "Claude pass 1/2: reviewing whole video, identifying objects and phases…";
+  const scout = await ask(
+`Watch ALL frames of this egocentric video carefully, start to finish
+(timestamps on each frame; total length ${duration.toFixed(1)} s).
+${hint ? "Annotator context (trust it): " + hint + "." : ""}
+Return ONLY JSON, no other text:
+{"activity":"one line: what is being done overall",
+ "objects":[{"name":"precise consistent name (colour + object)","role":"how hands use it"}],
+ "phases":[{"start":0.0,"end":0.0,"what":"goal during this span"}],
+ "hand_pattern":"what LEFT hand does vs what RIGHT hand does, and when they swap"}
+Rules: list EVERY object the hands touch, each with ONE precise name you could
+use consistently in labels. Phases are spans where the person's goal changes -
+watch to the very end and never miss an activity change.`, 1500);
+
+  // ---- PASS 2: segment-first, using the pass-1 map
+  el("msg").textContent = "Claude pass 2/2: creating segments and labels…";
   let ctx = `The video is EXACTLY ${duration.toFixed(1)} seconds long. ` +
     `Cover 0.0 to ${duration.toFixed(1)} contiguously - your last segment must ` +
-    `end at ${duration.toFixed(1)}.`;
+    `end at ${duration.toFixed(1)}.` +
+    `\n\nYOUR OWN REVIEW OF THIS VIDEO from a first viewing - trust these object` +
+    ` names, phases and hand pattern:\n${scout}\n\n` +
+    `SEGMENT-FIRST METHOD - follow in this order:\n` +
+    `1. Take the phase spans from your review.\n` +
+    `2. Inside each phase, place segment boundaries where hands engage/disengage` +
+    ` an object or the immediate goal changes. Boundaries must sit at real` +
+    ` moments you can see, not at round numbers.\n` +
+    `3. Only AFTER boundaries are fixed, write each label describing ONLY the` +
+    ` actions inside that segment, in order. Maximum 3 atomic actions and 2` +
+    ` separators per label - if more actions happen inside, SPLIT the segment.\n` +
+    `4. Consecutive segments may repeat the same label ONLY for a genuinely` +
+    ` repeated cycle (5+ repetitions of the same short action). Otherwise every` +
+    ` segment must describe its own distinct actions.`;
   if (hint) ctx += `\nANNOTATOR CONTEXT (trust for objects/activity): ${hint}. ` +
     `Use these exact object names.`;
   if (cfg.examples && cfg.examples.length)
     ctx += "\nMatch the style of these human-verified examples:" +
       cfg.examples.map((x) => `\nQA-APPROVED EXAMPLE from '${x.title}':\n` +
         JSON.stringify({ segments: x.segments })).join("");
-  const content = [{ type: "text", text: GUIDELINES + "\n\n" + ctx }];
-  for (const s of sheets)
-    content.push({ type: "image", source: {
-      type: "base64", media_type: "image/jpeg", data: s } });
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": cfg.key,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({ model: cfg.model, max_tokens: 8000,
-      messages: [{ role: "user", content }] }),
-  });
-  if (!r.ok) {
-    let msg = "";
-    try { msg = (await r.json())?.error?.message || ""; } catch {}
-    throw new Error("Claude API error " + r.status + (msg ? ": " + msg.slice(0, 200) : ""));
-  }
-  const data = await r.json();
-  let text = (data.content || []).map((p) => p.text || "").join("");
+
+  let text = await ask(GUIDELINES + "\n\n" + ctx, 8000);
   text = text.replace(/```(json)?/g, "");
   const s = text.indexOf("{"), e2 = text.lastIndexOf("}");
   try {
