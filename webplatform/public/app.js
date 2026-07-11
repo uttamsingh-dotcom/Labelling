@@ -23,7 +23,9 @@ async function api(path, opts = {}) {
   if (r.status === 401 || r.status === 403) {
     if ((data?.error || "").includes("Login")) { logout(); throw new Error("Session expired - log in again"); }
   }
-  if (!r.ok) throw new Error(data?.error || r.statusText);
+  if (!r.ok) throw new Error(data?.error ||
+    (r.status === 413 ? "Frames too large for upload - try again (auto-compress will kick in)"
+                      : "HTTP " + r.status));
   return data;
 }
 function logout() { store.token = ""; store.me = null; location.hash = "#/login"; render(); }
@@ -697,10 +699,12 @@ async function extractSheets(mainVid, onProgress) {
     }
     sheets.push(canvas.toDataURL("image/jpeg", quality).split(",")[1]);
   }
-  // keep total payload under ~4.3 MB (Netlify request limit is 6 MB)
-  let total = sheets.reduce((a, s) => a + s.length, 0) * 0.75;
-  if (total > 4.3e6) {
-    const scale = Math.sqrt(4.2e6 / total);
+  // keep total request under ~3.4 MB of base64 text (Netlify limit is ~6 MB
+  // and base64 + JSON overhead roughly doubles raw bytes)
+  for (let pass = 0; pass < 3; pass++) {
+    const total = sheets.reduce((a, s) => a + s.length, 0);
+    if (total <= 3.4e6) break;
+    const scale = Math.max(0.45, Math.sqrt(3.2e6 / total));
     for (let i = 0; i < sheets.length; i++) {
       const img = new Image();
       img.src = "data:image/jpeg;base64," + sheets[i];
@@ -708,7 +712,7 @@ async function extractSheets(mainVid, onProgress) {
       const c2 = document.createElement("canvas");
       c2.width = Math.round(img.width * scale); c2.height = Math.round(img.height * scale);
       c2.getContext("2d").drawImage(img, 0, 0, c2.width, c2.height);
-      sheets[i] = c2.toDataURL("image/jpeg", 0.5).split(",")[1];
+      sheets[i] = c2.toDataURL("image/jpeg", 0.45).split(",")[1];
     }
   }
   return sheets;
