@@ -635,6 +635,59 @@ async function reviewTask(status) {
 }
 
 // ---------------------------------------------------------------- AI draft
+const GUIDELINES = `You are an expert egocentric-video action annotator. You receive contact
+sheets of video frames sampled at 2 fps; each frame shows its timestamp. Segment
+the video and label the ego person's hand-object interactions, in the exact
+chronological order actions occur.
+
+SEGMENT RULES - all mandatory:
+- Every segment MUST be 10.0 seconds or SHORTER. Split long activities.
+- Cover the whole timeline contiguously from 0.0 to the end. Do NOT stop early.
+- A segment starts when hands engage an object or the goal changes; it ends when
+  hands disengage or the goal changes.
+- Label "no action" ONLY when hands touch nothing for MORE than 5 continuous
+  seconds (rare). Shorter idle moments are absorbed into neighbouring segments.
+- If a short action cycle repeats 5+ times, one label may cover up to 10 s.
+- NEVER return one giant segment or identical uniform blocks. Activities CHANGE -
+  place boundaries at real changes. Watch to the very end.
+- Watch BOTH hands separately - they usually do different things at the same
+  time (one anchors/places while the other picks/plucks).
+- Do not invent steps. Do not label walking, looking, camera/face touches.
+
+OBJECT NAMING - critical: name every object precisely and consistently. If
+annotator context supplies object names, use exactly those. NEVER use vague
+words: item, thing, stuff, material, something.
+NO HALLUCINATION: name ONLY objects you can clearly see. If uncertain, describe
+by colour and shape (e.g. 'white round container') instead of guessing.
+
+LABEL RULES: imperative, under 20 words, 1-3 atomic actions, max two separators,
+actions in the order they happen. Always name the specific object and ALWAYS
+state the hand: with left hand / with right hand / with both hands, or
+'with <tool> in right hand'. Comma separates a left-hand action from a
+right-hand action; 'and' only joins actions by the same hand.
+FORBIDDEN words: the, a, an, it, them, they, -ing verb forms, adjust, manipulate,
+move, transfer, reach, inspect, check, examine, handover, give, tool, object,
+utensil, cutlery, silverware. Object leaves surface = 'pick up'; set down = 'place'.
+
+CLIENT AUDIT LESSONS - the exact mistakes the client rejects most. Obey strictly:
+1. LABEL BOTH HANDS. WRONG: "pick up and place vegetables in bun with tong in
+   right hand" -> RIGHT: "hold bun with left hand, pick up and place vegetables
+   in bun with tong in right hand".
+2. NEVER write "hold X" when that hand is actively doing something. WRONG:
+   "hold pan handle with left hand, hold spatula with right hand" -> RIGHT:
+   "hold pan handle with left hand, stir food in pan with spatula in right hand".
+3. CAPTURE MICRO-ACTIONS: shift, pass, pick up, place, pour, scoop, flip, turn, wipe.
+4. ACTIONS IN EXACT TEMPORAL ORDER within the label.
+5. ONE CONSISTENT OBJECT NAME across ALL segments.
+6. TOOL PHRASING: "<action> <object> with <tool> in <hand>".
+7. VERB CONSISTENCY: one verb per repeated activity.
+
+OUTPUT: return ONLY valid JSON:
+{"segments":[{"start":0.0,"end":2.0,"label":"...","confidence":"high|medium|low",
+"note":"what to verify, only if uncertain"}]}
+Times in seconds, one decimal. Verify every segment is <=10.0 s and every label
+names hand + specific action + specific object.`;
+
 async function aiDraft() {
   if (window._readonly) return;
   if (ED.segs.length && !confirm("Replace current segments with AI draft?")) return;
@@ -643,31 +696,67 @@ async function aiDraft() {
     "(leave empty to skip)") || "";
   const btn = el("aibtn"); btn.disabled = true;
   try {
-    el("msg").textContent = "Extracting frames from your local video…";
+    el("msg").textContent = "Preparing…";
+    const cfg = await api("aikey?hint=" +
+      encodeURIComponent(hint + " " + ED.task.title));
     const v = V();
     const sheets = await extractSheets(v, (p) =>
-      el("msg").textContent = `Extracting frames… ${Math.round(p * 100)}%`);
-    el("msg").textContent = "Sending frames to Claude - the video itself is not uploaded…";
-    await api("aidraft-background", { method: "POST", body: {
-      id: ED.task.id, hint, duration: v.duration, sheets } });
-    el("msg").textContent = "Claude is studying the frames (1-3 minutes). Keep this page open…";
-    const t0 = Date.now();
-    while (Date.now() - t0 < 8 * 60e3) {
-      await new Promise((r) => setTimeout(r, 5000));
-      const d = await api("draft?id=" + ED.task.id);
-      if (d.draft_status === "done") {
-        ED.segs = splitMax10(d.draft.segments || []).map((s) => ({
-          start: +s.start, end: +s.end, label: s.label || "",
-          confidence: s.confidence || "", note: s.note || "" }));
-        ED.sel = -1; renderRows();
-        el("msg").textContent = "AI draft loaded - verify every segment against playback.";
-        btn.disabled = false; return;
-      }
-      if (d.draft_status === "error") throw new Error(d.draft?.error || "draft failed");
-    }
-    throw new Error("Timed out - try again.");
+      el("msg").textContent = `Extracting frames from your local video… ${Math.round(p * 100)}%`);
+    el("msg").textContent =
+      "Claude is studying the frames (1-3 minutes). Keep this page open…";
+    const segs = await callClaude(cfg, sheets, v.duration, hint);
+    ED.segs = splitMax10(segs).map((s) => ({
+      start: +s.start, end: +s.end, label: s.label || "",
+      confidence: s.confidence || "", note: s.note || "" }));
+    ED.sel = -1; renderRows(); saveSegs();
+    el("msg").textContent = "AI draft loaded - verify every segment against playback.";
   } catch (e) { el("msg").textContent = "AI draft failed: " + e.message; }
   btn.disabled = false;
+}
+
+async function callClaude(cfg, sheets, duration, hint) {
+  let ctx = `The video is EXACTLY ${duration.toFixed(1)} seconds long. ` +
+    `Cover 0.0 to ${duration.toFixed(1)} contiguously - your last segment must ` +
+    `end at ${duration.toFixed(1)}.`;
+  if (hint) ctx += `\nANNOTATOR CONTEXT (trust for objects/activity): ${hint}. ` +
+    `Use these exact object names.`;
+  if (cfg.examples && cfg.examples.length)
+    ctx += "\nMatch the style of these human-verified examples:" +
+      cfg.examples.map((x) => `\nQA-APPROVED EXAMPLE from '${x.title}':\n` +
+        JSON.stringify({ segments: x.segments })).join("");
+  const content = [{ type: "text", text: GUIDELINES + "\n\n" + ctx }];
+  for (const s of sheets)
+    content.push({ type: "image", source: {
+      type: "base64", media_type: "image/jpeg", data: s } });
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": cfg.key,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({ model: cfg.model, max_tokens: 8000,
+      messages: [{ role: "user", content }] }),
+  });
+  if (!r.ok) {
+    let msg = "";
+    try { msg = (await r.json())?.error?.message || ""; } catch {}
+    throw new Error("Claude API error " + r.status + (msg ? ": " + msg.slice(0, 200) : ""));
+  }
+  const data = await r.json();
+  let text = (data.content || []).map((p) => p.text || "").join("");
+  text = text.replace(/```(json)?/g, "");
+  const s = text.indexOf("{"), e2 = text.lastIndexOf("}");
+  try {
+    return JSON.parse(text.slice(s, e2 + 1)).segments || [];
+  } catch {
+    const m = text.match(/\{[^{}]*"label"[^{}]*\}/g) || [];
+    const arr = [];
+    for (const o of m) { try { arr.push(JSON.parse(o)); } catch {} }
+    if (!arr.length) throw new Error("Claude reply could not be parsed - try again");
+    return arr;
+  }
 }
 
 async function extractSheets(mainVid, onProgress) {
@@ -699,12 +788,12 @@ async function extractSheets(mainVid, onProgress) {
     }
     sheets.push(canvas.toDataURL("image/jpeg", quality).split(",")[1]);
   }
-  // keep total request under ~3.4 MB of base64 text (Netlify limit is ~6 MB
-  // and base64 + JSON overhead roughly doubles raw bytes)
+  // frames go straight to the Claude API (no Netlify size cap);
+  // stay comfortably under Anthropic's request limit
   for (let pass = 0; pass < 3; pass++) {
     const total = sheets.reduce((a, s) => a + s.length, 0);
-    if (total <= 3.4e6) break;
-    const scale = Math.max(0.45, Math.sqrt(3.2e6 / total));
+    if (total <= 1.8e7) break;
+    const scale = Math.max(0.45, Math.sqrt(1.6e7 / total));
     for (let i = 0; i < sheets.length; i++) {
       const img = new Image();
       img.src = "data:image/jpeg;base64," + sheets[i];
