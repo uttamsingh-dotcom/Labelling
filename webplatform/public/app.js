@@ -1,5 +1,6 @@
 /* LabelDesk SPA - videos stay on the labeller's computer; only labels are stored. */
 "use strict";
+const APP_VER = "v3";
 
 // ---------------------------------------------------------------- state & api
 const store = {
@@ -105,7 +106,7 @@ function shell(title, bodyHTML, active) {
       <div class="logo"><span class="dot">L</span>LabelDesk</div>
       <div class="nav">${nav}</div>
       <div class="sb-foot"><div class="who">${esc(me.username)}</div>
-        <div style="margin-bottom:8px">${me.role}</div>
+        <div style="margin-bottom:8px">${me.role} &middot; ${APP_VER}</div>
         <a onclick="logout()">Sign out</a></div>
     </div>
     <div class="content">
