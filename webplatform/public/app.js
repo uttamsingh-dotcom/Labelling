@@ -714,25 +714,37 @@ async function aiDraft() {
     const cfg = await api("aikey?hint=" +
       encodeURIComponent(hint + " " + ED.task.title));
     const v = V();
-    const sheets = await extractSheets(v, (p) =>
-      el("msg").textContent = `Extracting frames from your local video… ${Math.round(p * 100)}%`);
-    el("msg").textContent =
-      "Claude is studying the frames (1-3 minutes). Keep this page open…";
-    const segs = await callClaude(cfg, sheets, v.duration, hint);
+    // high-resolution sheets (2x2, 1 fps) - hands clearly visible
+    const hiSheets = await extractSheets(v, (p) =>
+      el("msg").textContent = `Extracting high-res frames… ${Math.round(p * 100)}%`,
+      { fps: 1, cols: 2, rows: 2, tileW: 720, tileH: 405, quality: 0.6 });
+    // standard sheets (4x3, 2 fps) - fine time resolution for action order
+    const stdSheets = await extractSheets(v, (p) =>
+      el("msg").textContent = `Extracting 2fps frames… ${Math.round(p * 100)}%`,
+      { fps: 2, cols: 4, rows: 3, tileW: 288, tileH: 162, quality: 0.5 });
+    const { segs, cost } = await callClaude(cfg, hiSheets, stdSheets, v.duration, hint);
     ED.segs = splitMax10(segs).map((s) => ({
       start: +s.start, end: +s.end, label: s.label || "",
       confidence: s.confidence || "", note: s.note || "" }));
     ED.sel = -1; renderRows(); saveSegs();
-    el("msg").textContent = "AI draft loaded - verify every segment against playback.";
+    el("msg").textContent = `AI draft loaded (cost ~Rs ${cost.toFixed(1)}) - ` +
+      "verify every segment against playback.";
   } catch (e) { el("msg").textContent = "AI draft failed: " + e.message; }
   btn.disabled = false;
 }
 
-async function callClaude(cfg, sheets, duration, hint) {
-  const imgs = sheets.map((s) => ({ type: "image", source: {
-    type: "base64", media_type: "image/jpeg", data: s } }));
+const RATES = {   // USD per million tokens {in, out}
+  sonnet: { i: 3, o: 15 }, haiku: { i: 1, o: 5 } };
+function modelRate(m) { return /haiku/i.test(m) ? RATES.haiku : RATES.sonnet; }
 
-  async function ask(text, maxTokens) {
+async function callClaude(cfg, hiSheets, stdSheets, duration, hint) {
+  let usd = 0;
+
+  async function ask(model, text, sheets, maxTokens) {
+    const content = [{ type: "text", text }];
+    for (const s of (sheets || []))
+      content.push({ type: "image", source: {
+        type: "base64", media_type: "image/jpeg", data: s } });
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -741,8 +753,8 @@ async function callClaude(cfg, sheets, duration, hint) {
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true",
       },
-      body: JSON.stringify({ model: cfg.model, max_tokens: maxTokens,
-        messages: [{ role: "user", content: [{ type: "text", text }, ...imgs] }] }),
+      body: JSON.stringify({ model, max_tokens: maxTokens,
+        messages: [{ role: "user", content }] }),
     });
     if (!r.ok) {
       let msg = "";
@@ -750,74 +762,105 @@ async function callClaude(cfg, sheets, duration, hint) {
       throw new Error("Claude API error " + r.status + (msg ? ": " + msg.slice(0, 200) : ""));
     }
     const data = await r.json();
+    const u = data.usage || {}, rate = modelRate(model);
+    usd += (u.input_tokens || 0) / 1e6 * rate.i + (u.output_tokens || 0) / 1e6 * rate.o;
     return (data.content || []).map((p) => p.text || "").join("");
   }
 
-  // ---- PASS 1: review the ENTIRE video first - objects, phases, hands
-  el("msg").textContent =
-    "Claude pass 1/2: reviewing whole video, identifying objects and phases…";
-  const scout = await ask(
-`Watch ALL frames of this egocentric video carefully, start to finish
-(timestamps on each frame; total length ${duration.toFixed(1)} s).
-${hint ? "Annotator context (trust it): " + hint + "." : ""}
-Return ONLY JSON, no other text:
-{"activity":"one line: what is being done overall",
- "objects":[{"name":"precise consistent name (colour + object)","role":"how hands use it"}],
- "phases":[{"start":0.0,"end":0.0,"what":"goal during this span"}],
- "hand_pattern":"what LEFT hand does vs what RIGHT hand does, and when they swap"}
-Rules: list EVERY object the hands touch, each with ONE precise name you could
-use consistently in labels. Phases are spans where the person's goal changes -
-watch to the very end and never miss an activity change.`, 1500);
+  function parseSegs(text) {
+    text = text.replace(/```(json)?/g, "");
+    const s = text.indexOf("{"), e2 = text.lastIndexOf("}");
+    try { return JSON.parse(text.slice(s, e2 + 1)); }
+    catch {
+      const m = text.match(/\{[^{}]*"label"[^{}]*\}/g) || [];
+      const arr = [];
+      for (const o of m) { try { arr.push(JSON.parse(o)); } catch {} }
+      if (!arr.length) throw new Error("Claude reply could not be parsed - try again");
+      return { segments: arr };
+    }
+  }
 
-  // ---- PASS 2: segment-first, using the pass-1 map
-  el("msg").textContent = "Claude pass 2/2: creating segments and labels…";
-  let ctx = `The video is EXACTLY ${duration.toFixed(1)} seconds long. ` +
-    `Cover 0.0 to ${duration.toFixed(1)} contiguously - your last segment must ` +
-    `end at ${duration.toFixed(1)}.` +
-    `\n\nYOUR OWN REVIEW OF THIS VIDEO from a first viewing - trust these object` +
-    ` names, phases and hand pattern:\n${scout}\n\n` +
-    `SEGMENT-FIRST METHOD - follow in this order:\n` +
-    `1. Take the phase spans from your review.\n` +
-    `2. Inside each phase, place segment boundaries where hands engage/disengage` +
-    ` an object or the immediate goal changes. Boundaries must sit at real` +
-    ` moments you can see, not at round numbers.\n` +
-    `3. Only AFTER boundaries are fixed, write each label describing ONLY the` +
-    ` actions inside that segment, in order. Maximum 3 atomic actions and 2` +
-    ` separators per label - if more actions happen inside, SPLIT the segment.\n` +
-    `4. Consecutive segments may repeat the same label ONLY for a genuinely` +
-    ` repeated cycle (5+ repetitions of the same short action). Otherwise every` +
-    ` segment must describe its own distinct actions.`;
-  if (hint) ctx += `\nANNOTATOR CONTEXT (trust for objects/activity): ${hint}. ` +
-    `Use these exact object names.`;
+  const HANDRULE =
+`HAND IDENTIFICATION (critical - never assume): this is an egocentric (first
+person) view. The person's LEFT hand/arm enters from the LOWER-LEFT of the
+frame, the RIGHT hand/arm from the LOWER-RIGHT. Track each arm from its side
+across consecutive frames. When arms cross, follow the arm, not the position.
+If you cannot clearly see which hand acts in a frame, check the adjacent
+frames of the same sheet. Never write a hand you did not verify visually.`;
+
+  // ---- STAGE 1 (vision model, HIGH-RES 1 fps): see objects, phases, hands, draft
+  el("msg").textContent = "Stage 1/3: reviewing video in high resolution…";
+  const s1 = await ask(cfg.visionModel || cfg.model,
+`Watch ALL frames of this egocentric video start to finish (timestamps on
+frames; total ${duration.toFixed(1)} s). Frames are high resolution, 1 per second.
+${hint ? "Annotator context (trust it): " + hint + "." : ""}
+${HANDRULE}
+Return ONLY JSON:
+{"activity":"one line",
+ "objects":[{"name":"precise consistent name (colour + object)","role":"how used"}],
+ "phases":[{"start":0.0,"end":0.0,"what":"goal in this span"}],
+ "hand_pattern":"exactly what LEFT hand does vs RIGHT hand, and when roles change",
+ "segments":[{"start":0.0,"end":0.0,"actions":"plain description of what happens,
+  in order, naming which hand does each thing"}]}
+Segment rules: max 10 s each, cover 0.0 to ${duration.toFixed(1)} contiguously,
+boundaries where hands engage/disengage or goal changes, max 3 actions inside
+one segment - split if more. Watch to the very end - activities change.`,
+    hiSheets, 3500);
+
+  // ---- STAGE 2 (vision model, 2 fps): verify ORDER + hands against time
+  el("msg").textContent = "Stage 2/3: verifying action order and hands at 2 fps…";
+  const s2 = await ask(cfg.visionModel || cfg.model,
+`These frames are sampled at 2 per second (timestamps on frames; total
+${duration.toFixed(1)} s). Below is a draft analysis made from 1 fps frames.
+${HANDRULE}
+DRAFT:\n${s1}\n
+Your job - verify every draft segment against these 2 fps frames:
+1. ORDER: are the actions inside each segment in the exact order they happen?
+   Fix any wrong order.
+2. HANDS: is each action assigned to the correct hand? Fix any wrong hand.
+3. BOUNDARIES: adjust start/end to the nearest 0.5 s where the engagement
+   really changes; segments must stay contiguous, max 10 s, and cover the full
+   ${duration.toFixed(1)} s.
+4. MISSED ACTIONS: add micro-actions visible at 2 fps that the draft missed
+   (shift, pass, pick up, place, pour, flip, turn, wipe).
+Return ONLY JSON: {"segments":[{"start":0.0,"end":0.0,"actions":"corrected
+plain description, in order, with verified hands"}]}`,
+    stdSheets, 3500);
+
+  // ---- STAGE 3 (text model, NO images): write SOP-grammar labels
+  el("msg").textContent = "Stage 3/3: writing labels in client grammar…";
+  let ctx =
+`Video length: EXACTLY ${duration.toFixed(1)} s. Below are verified segment
+descriptions from frame analysis (order and hands already checked - do NOT
+change hands, order, or timings; only rewrite wording into label grammar):
+${s2}
+Object names to use consistently (from the same analysis):
+${s1.slice(0, 1200)}
+Convert each segment description into ONE label following every rule above.
+If a description contains more than 3 atomic actions, split that segment.
+Keep segments contiguous and <=10 s.`;
+  if (hint) ctx += `\nAnnotator context: ${hint}. Use these exact object names.`;
   if (cfg.examples && cfg.examples.length)
     ctx += "\nMatch the style of these human-verified examples:" +
       cfg.examples.map((x) => `\nQA-APPROVED EXAMPLE from '${x.title}':\n` +
         JSON.stringify({ segments: x.segments })).join("");
+  const s3 = await ask(cfg.model, GUIDELINES + "\n\n" + ctx, null, 4000);
 
-  let text = await ask(GUIDELINES + "\n\n" + ctx, 8000);
-  text = text.replace(/```(json)?/g, "");
-  const s = text.indexOf("{"), e2 = text.lastIndexOf("}");
-  try {
-    return JSON.parse(text.slice(s, e2 + 1)).segments || [];
-  } catch {
-    const m = text.match(/\{[^{}]*"label"[^{}]*\}/g) || [];
-    const arr = [];
-    for (const o of m) { try { arr.push(JSON.parse(o)); } catch {} }
-    if (!arr.length) throw new Error("Claude reply could not be parsed - try again");
-    return arr;
-  }
+  const out = parseSegs(s3);
+  return { segs: out.segments || [], cost: usd * 90 };  // rough USD->INR
 }
 
-async function extractSheets(mainVid, onProgress) {
-  // sample the LOCAL video at 2 fps into 4x3 contact sheets with timestamps
+async function extractSheets(mainVid, onProgress, opt = {}) {
+  // sample the LOCAL video into contact sheets with timestamps
   const v = document.createElement("video");
   v.muted = true; v.preload = "auto"; v.src = mainVid.currentSrc || ED.url;
   await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = rej; });
-  const D = v.duration, stepT = 0.5, per = 12, cols = 4;
-  const TW = 480, TH = 270;
+  const D = v.duration, stepT = 1 / (opt.fps || 2), cols = opt.cols || 4;
+  const per = cols * (opt.rows || 3);
+  const TW = opt.tileW || 480, TH = opt.tileH || 270;
   const times = []; for (let t2 = 0; t2 < D; t2 += stepT) times.push(t2);
   const nSheets = Math.ceil(times.length / per);
-  let quality = nSheets > 16 ? 0.45 : 0.55;
+  let quality = opt.quality || (nSheets > 16 ? 0.45 : 0.55);
   const sheets = [];
   for (let si = 0; si < nSheets; si++) {
     const canvas = document.createElement("canvas");
