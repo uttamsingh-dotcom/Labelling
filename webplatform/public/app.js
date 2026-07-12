@@ -870,10 +870,24 @@ Include shift, pass, flip, turn, pour, wipe when they happen. A segment
 description that skips these actions is WRONG. List actions in the exact
 order they occur - never reorder.`;
 
+  const NOFAKE =
+`REALITY CHECK FIRST: confirm you can actually see photographic video frames
+attached to this message. If there are no images, or they are blank/black/
+unreadable, respond with EXACTLY {"error":"no frames"} and NOTHING else.
+NEVER describe, guess, or infer video content you cannot literally see -
+fabricated output is the worst possible failure.`;
+
+  function assertFrames(reply, stage) {
+    if (/"error"\s*:\s*"no frames"/i.test(reply))
+      throw new Error("Claude reports the frames were blank/unreadable (stage " +
+        stage + "). Play the video for a second, keep the tab visible, then try again.");
+  }
+
   // ---- STAGE 1 (vision model, HIGH-RES 1 fps): see objects, phases, hands, draft
   el("msg").textContent = "Stage 1/3: reviewing video in high resolution…";
   const s1 = await ask(vm,
-`Watch ALL frames of this egocentric video start to finish (timestamps on
+`${NOFAKE}
+Watch ALL frames of this egocentric video start to finish (timestamps on
 frames; total ${duration.toFixed(1)} s). Frames are high resolution, 1 per second.
 ${hint ? "Annotator context (trust it): " + hint : ""}
 ${HANDRULE}
@@ -890,11 +904,13 @@ Segment rules: max 10 s each, cover 0.0 to ${duration.toFixed(1)} contiguously,
 boundaries where hands engage/disengage or goal changes, max 3 actions inside
 one segment - split if more. Watch to the very end - activities change.`,
     hiSheets, 3500);
+  assertFrames(s1, 1);
 
   // ---- STAGE 2 (vision model, 2 fps): verify ORDER + hands against time
   el("msg").textContent = "Stage 2/3: verifying action order and hands at 2 fps…";
   const s2 = await ask(vm,
-`These frames are sampled at 2 per second (timestamps on frames; total
+`${NOFAKE}
+These frames are sampled at 2 per second (timestamps on frames; total
 ${duration.toFixed(1)} s). Below is a draft analysis made from 1 fps frames.
 ${HANDRULE}
 ${OBJRULE}
@@ -911,6 +927,7 @@ Your job - verify every draft segment against these 2 fps frames:
 Return ONLY JSON: {"segments":[{"start":0.0,"end":0.0,"actions":"corrected
 plain description, in order, with verified hands"}]}`,
     stdSheets, 3500);
+  assertFrames(s2, 2);
 
   // ---- STAGE 3 (text model, NO images): write SOP-grammar labels
   el("msg").textContent = "Stage 3/3: writing labels in client grammar…";
@@ -980,6 +997,10 @@ async function extractSheets(mainVid, onProgress, opt = {}) {
   const v = document.createElement("video");
   v.muted = true; v.preload = "auto"; v.src = mainVid.currentSrc || ED.url;
   await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = rej; });
+  // force the decoder awake - some browsers deliver black frames until playback
+  try { await v.play(); await new Promise((r) => setTimeout(r, 150)); v.pause(); } catch {}
+  if (v.readyState < 2)
+    await new Promise((r) => v.addEventListener("loadeddata", r, { once: true }));
   const D = v.duration, stepT = 1 / (opt.fps || 2), cols = opt.cols || 4;
   const per = cols * (opt.rows || 3);
   const TW = opt.tileW || 480, TH = opt.tileH || 270;
@@ -1003,6 +1024,19 @@ async function extractSheets(mainVid, onProgress, opt = {}) {
       ctx.fillText(`${mm}:${ss < 10 ? "0" : ""}${ss.toFixed(1)}`, x + 4, y + 16);
       onProgress?.((si * per + i + 1) / times.length);
     }
+    if (canvasBlank(canvas)) {
+      // one retry for this sheet after nudging the decoder
+      try { await v.play(); await new Promise((r) => setTimeout(r, 200)); v.pause(); } catch {}
+      const retryCtx = canvas.getContext("2d");
+      for (let i = 0; i < chunk.length; i++) {
+        await seekTo(v, chunk[i]);
+        retryCtx.drawImage(v, (i % cols) * TW, Math.floor(i / cols) * TH, TW, TH);
+      }
+      if (canvasBlank(canvas))
+        throw new Error("Frame capture failed (blank frames from your browser). " +
+          "Use Chrome or Edge, keep this tab visible during extraction, play the " +
+          "video for a second first, then try AI draft again.");
+    }
     sheets.push(canvas.toDataURL("image/jpeg", quality).split(",")[1]);
   }
   // frames go straight to the Claude API (no Netlify size cap);
@@ -1025,9 +1059,26 @@ async function extractSheets(mainVid, onProgress, opt = {}) {
 }
 function seekTo(v, t) {
   return new Promise((res) => {
-    const done = () => { v.removeEventListener("seeked", done); res(); };
-    v.addEventListener("seeked", done); v.currentTime = t;
+    let finished = false;
+    const finish = () => { if (!finished) { finished = true; res(); } };
+    const onSeek = () => {
+      v.removeEventListener("seeked", onSeek);
+      // wait for the frame to actually be painted, not just the seek to land
+      if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => finish());
+      else setTimeout(finish, 50);
+    };
+    v.addEventListener("seeked", onSeek);
+    v.currentTime = Math.min(Math.max(0, t), Math.max(0, v.duration - 0.05));
+    setTimeout(finish, 2000);            // safety net
   });
+}
+function canvasBlank(canvas) {
+  // sample pixels; near-zero average luminance = capture failed (black frames)
+  const ctx2 = canvas.getContext("2d");
+  const d = ctx2.getImageData(0, 0, canvas.width, canvas.height).data;
+  let sum = 0, n = 0;
+  for (let p = 0; p < d.length; p += 4 * 601) { sum += d[p] + d[p + 1] + d[p + 2]; n++; }
+  return (sum / (n * 3)) < 8;
 }
 
 // ---------------------------------------------------------------- import
