@@ -731,13 +731,21 @@ function showDraftForm(taskId) {
       <p class="hint" style="margin-top:6px">Claude may ONLY use these object names,
       exactly as written. Anything else it sees gets a colour+shape description,
       never an invented name. No extra adjectives will be added to your names.</p>
+      <p style="margin:12px 0 4px"><b>Draft quality</b></p>
+      <label class="hint" style="display:block;cursor:pointer">
+        <input type="radio" name="dfq" value="std" ${saved.quality !== "high" ? "checked" : ""}>
+        Standard (~Rs 8-10) - fast, hands may need more fixing</label>
+      <label class="hint" style="display:block;cursor:pointer">
+        <input type="radio" name="dfq" value="high" ${saved.quality === "high" ? "checked" : ""}>
+        High accuracy (~Rs 18-25) - stronger model watches the frames; better hands & atomic actions</label>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
         <button class="ghost" id="dfcancel">Cancel</button>
         <button id="dfgo">Start draft</button></div></div>`;
     document.body.appendChild(div);
     div.querySelector("#dfcancel").onclick = () => { div.remove(); res(null); };
     div.querySelector("#dfgo").onclick = () => {
-      const val = { activity: el("dfact").value.trim(), objects: el("dfobj").value.trim() };
+      const val = { activity: el("dfact").value.trim(), objects: el("dfobj").value.trim(),
+        quality: div.querySelector('input[name="dfq"]:checked')?.value || "std" };
       try { localStorage.setItem("ld_df_" + taskId, JSON.stringify(val)); } catch {}
       div.remove(); res(val);
     };
@@ -751,6 +759,7 @@ async function aiDraft() {
   if (!form) return;
   const hint = form.activity ? `Activity: ${form.activity}.` : "";
   const objects = (form.objects || "").split(",").map((t) => t.trim()).filter(Boolean);
+  const high = form.quality === "high";
   const btn = el("aibtn"); btn.disabled = true;
   try {
     el("msg").textContent = "Preparing…";
@@ -760,12 +769,15 @@ async function aiDraft() {
     // high-resolution sheets (2x2, 1 fps) - hands clearly visible
     const hiSheets = await extractSheets(v, (p) =>
       el("msg").textContent = `Extracting high-res frames… ${Math.round(p * 100)}%`,
-      { fps: 1, cols: 2, rows: 2, tileW: 720, tileH: 405, quality: 0.6 });
+      { fps: 1, cols: 2, rows: 2, tileW: high ? 854 : 720, tileH: high ? 480 : 405,
+        quality: 0.6 });
     // standard sheets (4x3, 2 fps) - fine time resolution for action order
     const stdSheets = await extractSheets(v, (p) =>
       el("msg").textContent = `Extracting 2fps frames… ${Math.round(p * 100)}%`,
-      { fps: 2, cols: 4, rows: 3, tileW: 288, tileH: 162, quality: 0.5 });
-    const { segs, cost } = await callClaude(cfg, hiSheets, stdSheets, v.duration, hint, objects);
+      { fps: 2, cols: 4, rows: 3, tileW: high ? 384 : 288, tileH: high ? 216 : 162,
+        quality: 0.5 });
+    const { segs, cost } = await callClaude(cfg, hiSheets, stdSheets, v.duration,
+      hint, objects, high);
     ED.segs = splitMax10(segs).map((s) => ({
       start: +s.start, end: +s.end, label: s.label || "",
       confidence: s.confidence || "", note: s.note || "" }));
@@ -780,8 +792,9 @@ const RATES = {   // USD per million tokens {in, out}
   sonnet: { i: 3, o: 15 }, haiku: { i: 1, o: 5 } };
 function modelRate(m) { return /haiku/i.test(m) ? RATES.haiku : RATES.sonnet; }
 
-async function callClaude(cfg, hiSheets, stdSheets, duration, hint, objects = []) {
+async function callClaude(cfg, hiSheets, stdSheets, duration, hint, objects = [], high = false) {
   let usd = 0;
+  const vm = high ? cfg.model : (cfg.visionModel || cfg.model);
 
   async function ask(model, text, sheets, maxTokens) {
     const content = [{ type: "text", text }];
@@ -859,7 +872,7 @@ order they occur - never reorder.`;
 
   // ---- STAGE 1 (vision model, HIGH-RES 1 fps): see objects, phases, hands, draft
   el("msg").textContent = "Stage 1/3: reviewing video in high resolution…";
-  const s1 = await ask(cfg.visionModel || cfg.model,
+  const s1 = await ask(vm,
 `Watch ALL frames of this egocentric video start to finish (timestamps on
 frames; total ${duration.toFixed(1)} s). Frames are high resolution, 1 per second.
 ${hint ? "Annotator context (trust it): " + hint : ""}
@@ -880,7 +893,7 @@ one segment - split if more. Watch to the very end - activities change.`,
 
   // ---- STAGE 2 (vision model, 2 fps): verify ORDER + hands against time
   el("msg").textContent = "Stage 2/3: verifying action order and hands at 2 fps…";
-  const s2 = await ask(cfg.visionModel || cfg.model,
+  const s2 = await ask(vm,
 `These frames are sampled at 2 per second (timestamps on frames; total
 ${duration.toFixed(1)} s). Below is a draft analysis made from 1 fps frames.
 ${HANDRULE}
@@ -919,8 +932,47 @@ in the same order.`;
         JSON.stringify({ segments: x.segments })).join("");
   const s3 = await ask(cfg.model, GUIDELINES + "\n\n" + ctx, null, 4000);
 
-  const out = parseSegs(s3);
-  return { segs: out.segments || [], cost: usd * 90 };  // rough USD->INR
+  // ---- MECHANICAL ENFORCEMENT: limits are guaranteed by code, not trust
+  let segs = (parseSegs(s3).segments || [])
+    .filter((x) => isFinite(+x.start) && isFinite(+x.end))
+    .map((x) => ({ ...x, start: Math.max(0, +x.start),
+      end: Math.min(duration, +x.end) }))
+    .filter((x) => x.end - x.start >= 0.2)
+    .sort((a, b) => a.start - b.start);
+
+  // repair pass: any label breaking word/action limits goes back once, text-only
+  const broken = [];
+  segs.forEach((x, i) => {
+    const bad = lintLabel(x.label, x.end - x.start)
+      .some((y) => y[0] === "err" && /words|separators/.test(y[1]));
+    if (bad) broken.push({ i, start: x.start, end: x.end, label: x.label });
+  });
+  if (broken.length) {
+    el("msg").textContent = "Fixing labels that break word/action limits…";
+    try {
+      const rep = await ask(cfg.model,
+`These labels violate limits (max 20 words; max 3 atomic actions = max 2
+separators, comma between different-hand actions, 'and' only same-hand).
+Rewrite each to comply WITHOUT changing hands, actions, order, objects or
+timings. Drop filler words first; if a label truly contains more than 3 atomic
+actions, split it into consecutive segments inside the same time range.
+${JSON.stringify({ broken })}
+Return ONLY JSON: {"fixes":[{"i":0,"segments":[{"start":0.0,"end":0.0,"label":"..."}]}]}`,
+        null, 1500);
+      const fixes = parseSegs(rep).fixes || JSON.parse(
+        rep.replace(/```(json)?/g, "").trim()).fixes || [];
+      const map = {};
+      for (const f of fixes) map[f.i] = f.segments || [];
+      const merged = [];
+      segs.forEach((x, i) => {
+        if (map[i] && map[i].length) merged.push(...map[i].map((n) => ({
+          ...x, ...n })));
+        else merged.push(x);
+      });
+      segs = merged;
+    } catch { /* keep originals; checker flags them for the labeller */ }
+  }
+  return { segs, cost: usd * 90 };  // rough USD->INR
 }
 
 async function extractSheets(mainVid, onProgress, opt = {}) {
