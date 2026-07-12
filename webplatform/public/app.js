@@ -1,6 +1,6 @@
 /* LabelDesk SPA - videos stay on the labeller's computer; only labels are stored. */
 "use strict";
-const APP_VER = "v3";
+const APP_VER = "v4";
 
 // ---------------------------------------------------------------- state & api
 const store = {
@@ -413,7 +413,9 @@ async function viewTask(id) {
         <button class="ghost" onclick="playSel()">Play selected <span class="kbd">P</span></button></div>
       <div class="transport">
         <button class="ghost" id="aibtn" onclick="aiDraft()">&#10024; AI draft (Claude)</button>
-        <button class="ghost" onclick="toggleImport()">&#128229; Paste AI result</button></div>
+        <button class="ghost" onclick="toggleImport()">&#128229; Paste AI result</button>
+        <button class="ghost" onclick="testFrames()">&#128269; Test frames</button>
+        <button class="ghost" onclick="copyDebug()">&#128203; Copy AI debug</button></div>
       <div id="importbox" style="display:none;margin-top:10px">
         <textarea id="importtxt" rows="5" style="width:100%;font-size:12px"
           placeholder="Paste a JSON segments reply here"></textarea>
@@ -526,6 +528,39 @@ function renderTL() {
       renderRows(); };
     box.appendChild(d);
   });
+}
+async function testFrames() {
+  // zero-cost check: show exactly what Claude would see from mid-video
+  try {
+    const v = V();
+    if (!v || !v.duration) { el("msg").textContent = "Load the video first."; return; }
+    el("msg").textContent = "Capturing test frames…";
+    const mid = v.duration / 2;
+    const sheets = await extractSheets(v, null,
+      { fps: 1, cols: 2, rows: 2, tileW: 720, tileH: 405, quality: 0.6,
+        from: mid, to: mid + 4 });
+    const div = document.createElement("div");
+    div.className = "modalbg";
+    div.innerHTML = `<div class="modal" style="width:min(860px,95vw)">
+      <h3>This is what Claude sees (4 frames from mid-video)</h3>
+      <img src="data:image/jpeg;base64,${sheets[0]}" style="width:100%;border-radius:8px">
+      <p class="hint">If this image is black/blank or unrecognisable, frame capture
+      is failing in your browser - tell your admin. If you can see the video
+      content clearly here, frames ARE reaching Claude.</p>
+      <div style="text-align:right;margin-top:10px">
+        <button onclick="this.closest('.modalbg').remove()">Close</button></div></div>`;
+    document.body.appendChild(div);
+    el("msg").textContent = "";
+  } catch (e) { el("msg").textContent = "Test frames failed: " + e.message; }
+}
+function copyDebug() {
+  const d = window._draftDebug;
+  if (!d) { el("msg").textContent = "No AI draft has run yet in this session."; return; }
+  const txt = JSON.stringify(d, null, 1);
+  try { navigator.clipboard.writeText(txt); el("msg").textContent =
+    "Debug report copied - paste it to your admin / support chat."; }
+  catch { console.log(txt); el("msg").textContent =
+    "Copy failed - debug printed to browser console (F12)."; }
 }
 function loopPlay(i) {
   // called when a label textarea gets focus: select + loop that segment
@@ -950,6 +985,15 @@ in the same order.`;
         JSON.stringify({ segments: x.segments })).join("");
   const s3 = await ask(cfg.model, GUIDELINES + "\n\n" + ctx, null, 4000);
 
+  window._draftDebug = {
+    ver: APP_VER, when: new Date().toISOString(),
+    visionModel: vm, textModel: cfg.model,
+    hiSheets: hiSheets.length, stdSheets: stdSheets.length,
+    hiBytes: hiSheets.reduce((a, s) => a + s.length, 0),
+    stage1: s1.slice(0, 1500), stage2: s2.slice(0, 1500), stage3: s3.slice(0, 1500),
+  };
+  console.log("LabelDesk draft debug", window._draftDebug);
+
   // ---- MECHANICAL ENFORCEMENT: limits are guaranteed by code, not trust
   let segs = (parseSegs(s3).segments || [])
     .filter((x) => isFinite(+x.start) && isFinite(+x.end))
@@ -1005,7 +1049,8 @@ async function extractSheets(mainVid, onProgress, opt = {}) {
   const D = v.duration, stepT = 1 / (opt.fps || 2), cols = opt.cols || 4;
   const per = cols * (opt.rows || 3);
   const TW = opt.tileW || 480, TH = opt.tileH || 270;
-  const times = []; for (let t2 = 0; t2 < D; t2 += stepT) times.push(t2);
+  const from = opt.from || 0, to = Math.min(D, opt.to || D);
+  const times = []; for (let t2 = from; t2 < to; t2 += stepT) times.push(t2);
   const nSheets = Math.ceil(times.length / per);
   let quality = opt.quality || (nSheets > 16 ? 0.45 : 0.55);
   const sheets = [];
