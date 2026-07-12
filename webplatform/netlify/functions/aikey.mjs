@@ -37,6 +37,7 @@ export async function handler(event) {
   return json(200, {
     key,
     model: process.env.CLAUDE_MODEL || "claude-sonnet-5",
+    visionModel: process.env.CLAUDE_VISION_MODEL || "claude-haiku-4-5-20251001",
     examples,
   });
 }
