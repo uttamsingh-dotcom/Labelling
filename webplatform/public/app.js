@@ -581,11 +581,20 @@ function renderRows() {
   let errs = 0;
   ED.segs.forEach((s) => errs += lintLabel(s.label, s.end - s.start).filter((x) => x[0] === "err").length);
   const inc = consistencyWarnings(ED.segs);
+  let gaps = 0, overs = 0;
+  const srt = [...ED.segs].sort((a, b) => a.start - b.start);
+  for (let k = 1; k < srt.length; k++) {
+    const d = srt[k].start - srt[k - 1].end;
+    if (d > 0.31) gaps++; else if (d < -0.31) overs++;
+  }
   el("summary").innerHTML = `<b>${ED.segs.length}</b> segments &middot; ` +
     (errs ? `<b style="color:#dc2626">${errs} issue(s) to fix</b>`
           : `<b style="color:#16a34a">all checks clear</b>`) +
     (inc.length ? `<div style="font-size:12px;color:#d97706;margin-top:3px">&#9888;
-     same object, different names: ${esc(inc.join(" · "))} - pick ONE name</div>` : "");
+     same object, different names: ${esc(inc.join(" · "))} - pick ONE name</div>` : "") +
+    ((gaps || overs) ? `<div style="font-size:12px;color:#d97706;margin-top:3px">&#9888;
+     timeline not contiguous: ${gaps ? gaps + " gap(s)" : ""}${gaps && overs ? ", " : ""}
+     ${overs ? overs + " overlap(s)" : ""} between segments - fix starts/ends</div>` : "");
   const li = el("loopinfo");
   if (li) li.textContent = ED.sel >= 0 ? `segment ${ED.sel + 1} of ${ED.segs.length} selected` : "";
   renderTL();
@@ -702,12 +711,46 @@ OUTPUT: return ONLY valid JSON:
 Times in seconds, one decimal. Verify every segment is <=10.0 s and every label
 names hand + specific action + specific object.`;
 
+function showDraftForm(taskId) {
+  return new Promise((res) => {
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem("ld_df_" + taskId) || "{}"); } catch {}
+    const div = document.createElement("div");
+    div.className = "modalbg";
+    div.innerHTML = `<div class="modal"><h3>AI draft - tell Claude what it is seeing</h3>
+      <p class="hint">Watch the video once first. What you type here becomes the
+      ground truth - the AI is not allowed to invent anything beyond it.</p>
+      <p style="margin:10px 0 4px"><b>Activity</b> (one line)</p>
+      <input id="dfact" style="width:100%"
+        placeholder="e.g. packing earbuds into small plastic pouches"
+        value="${esc(saved.activity || "")}">
+      <p style="margin:12px 0 4px"><b>Objects</b> - EXACT names to use in labels, comma separated</p>
+      <input id="dfobj" style="width:100%"
+        placeholder="e.g. earbuds, plastic pouch, tray, scissors"
+        value="${esc(saved.objects || "")}">
+      <p class="hint" style="margin-top:6px">Claude may ONLY use these object names,
+      exactly as written. Anything else it sees gets a colour+shape description,
+      never an invented name. No extra adjectives will be added to your names.</p>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+        <button class="ghost" id="dfcancel">Cancel</button>
+        <button id="dfgo">Start draft</button></div></div>`;
+    document.body.appendChild(div);
+    div.querySelector("#dfcancel").onclick = () => { div.remove(); res(null); };
+    div.querySelector("#dfgo").onclick = () => {
+      const val = { activity: el("dfact").value.trim(), objects: el("dfobj").value.trim() };
+      try { localStorage.setItem("ld_df_" + taskId, JSON.stringify(val)); } catch {}
+      div.remove(); res(val);
+    };
+  });
+}
+
 async function aiDraft() {
   if (window._readonly) return;
   if (ED.segs.length && !confirm("Replace current segments with AI draft?")) return;
-  const hint = prompt("Describe activity + objects so the AI names them correctly.\n" +
-    "Example: person plucks stems off green chillies and drops chillies into clay bowl\n" +
-    "(leave empty to skip)") || "";
+  const form = await showDraftForm(ED.task.id);
+  if (!form) return;
+  const hint = form.activity ? `Activity: ${form.activity}.` : "";
+  const objects = (form.objects || "").split(",").map((t) => t.trim()).filter(Boolean);
   const btn = el("aibtn"); btn.disabled = true;
   try {
     el("msg").textContent = "Preparing…";
@@ -722,7 +765,7 @@ async function aiDraft() {
     const stdSheets = await extractSheets(v, (p) =>
       el("msg").textContent = `Extracting 2fps frames… ${Math.round(p * 100)}%`,
       { fps: 2, cols: 4, rows: 3, tileW: 288, tileH: 162, quality: 0.5 });
-    const { segs, cost } = await callClaude(cfg, hiSheets, stdSheets, v.duration, hint);
+    const { segs, cost } = await callClaude(cfg, hiSheets, stdSheets, v.duration, hint, objects);
     ED.segs = splitMax10(segs).map((s) => ({
       start: +s.start, end: +s.end, label: s.label || "",
       confidence: s.confidence || "", note: s.note || "" }));
@@ -737,7 +780,7 @@ const RATES = {   // USD per million tokens {in, out}
   sonnet: { i: 3, o: 15 }, haiku: { i: 1, o: 5 } };
 function modelRate(m) { return /haiku/i.test(m) ? RATES.haiku : RATES.sonnet; }
 
-async function callClaude(cfg, hiSheets, stdSheets, duration, hint) {
+async function callClaude(cfg, hiSheets, stdSheets, duration, hint, objects = []) {
   let usd = 0;
 
   async function ask(model, text, sheets, maxTokens) {
@@ -788,16 +831,44 @@ across consecutive frames. When arms cross, follow the arm, not the position.
 If you cannot clearly see which hand acts in a frame, check the adjacent
 frames of the same sheet. Never write a hand you did not verify visually.`;
 
+  const OBJRULE = objects.length ?
+`ALLOWED OBJECT NAMES - these are the ONLY object names permitted anywhere in
+your output, written EXACTLY as given (letter for letter, no additions):
+${objects.join("; ")}.
+- Do NOT invent, rename, or guess any other object name.
+- If hands touch something not in this list, describe it by colour + shape
+  (e.g. 'white round container') - never a guessed name.
+- Do NOT add descriptors (colour, material, size, position) to these names.
+  Use the bare name exactly as listed.` :
+`OBJECT NAMES: name only objects you can clearly see. If uncertain, describe
+by colour + shape instead of guessing. No descriptors unless two similar
+objects must be told apart.`;
+
+  const LENRULE =
+`SEGMENT LENGTH: typical segments are 2-8 seconds. A segment close to 10 s is
+allowed ONLY for a genuinely repeated cycle (5+ repetitions of the same short
+action). NEVER produce uniform equal-length segments - boundaries must sit at
+visible moments where hands engage/disengage or the goal changes.`;
+
+  const ATOMRULE =
+`ATOMIC ACTION COMPLETENESS (mandatory): every time an object leaves a surface
+there is a 'pick up'; every time an object is set down there is a 'place'.
+Include shift, pass, flip, turn, pour, wipe when they happen. A segment
+description that skips these actions is WRONG. List actions in the exact
+order they occur - never reorder.`;
+
   // ---- STAGE 1 (vision model, HIGH-RES 1 fps): see objects, phases, hands, draft
   el("msg").textContent = "Stage 1/3: reviewing video in high resolution…";
   const s1 = await ask(cfg.visionModel || cfg.model,
 `Watch ALL frames of this egocentric video start to finish (timestamps on
 frames; total ${duration.toFixed(1)} s). Frames are high resolution, 1 per second.
-${hint ? "Annotator context (trust it): " + hint + "." : ""}
+${hint ? "Annotator context (trust it): " + hint : ""}
 ${HANDRULE}
+${OBJRULE}
+${LENRULE}
+${ATOMRULE}
 Return ONLY JSON:
 {"activity":"one line",
- "objects":[{"name":"precise consistent name (colour + object)","role":"how used"}],
  "phases":[{"start":0.0,"end":0.0,"what":"goal in this span"}],
  "hand_pattern":"exactly what LEFT hand does vs RIGHT hand, and when roles change",
  "segments":[{"start":0.0,"end":0.0,"actions":"plain description of what happens,
@@ -813,16 +884,17 @@ one segment - split if more. Watch to the very end - activities change.`,
 `These frames are sampled at 2 per second (timestamps on frames; total
 ${duration.toFixed(1)} s). Below is a draft analysis made from 1 fps frames.
 ${HANDRULE}
+${OBJRULE}
+${LENRULE}
 DRAFT:\n${s1}\n
 Your job - verify every draft segment against these 2 fps frames:
 1. ORDER: are the actions inside each segment in the exact order they happen?
    Fix any wrong order.
 2. HANDS: is each action assigned to the correct hand? Fix any wrong hand.
-3. BOUNDARIES: adjust start/end to the nearest 0.5 s where the engagement
-   really changes; segments must stay contiguous, max 10 s, and cover the full
-   ${duration.toFixed(1)} s.
-4. MISSED ACTIONS: add micro-actions visible at 2 fps that the draft missed
-   (shift, pass, pick up, place, pour, flip, turn, wipe).
+3. BOUNDARIES: adjust start/end to where the engagement really changes;
+   segments must stay contiguous, max 10 s, and cover the full
+   ${duration.toFixed(1)} s. Split any segment that mixes different goals.
+4. MISSED ACTIONS: ${ATOMRULE}
 Return ONLY JSON: {"segments":[{"start":0.0,"end":0.0,"actions":"corrected
 plain description, in order, with verified hands"}]}`,
     stdSheets, 3500);
@@ -834,12 +906,13 @@ plain description, in order, with verified hands"}]}`,
 descriptions from frame analysis (order and hands already checked - do NOT
 change hands, order, or timings; only rewrite wording into label grammar):
 ${s2}
-Object names to use consistently (from the same analysis):
-${s1.slice(0, 1200)}
+${OBJRULE}
 Convert each segment description into ONE label following every rule above.
 If a description contains more than 3 atomic actions, split that segment.
-Keep segments contiguous and <=10 s.`;
-  if (hint) ctx += `\nAnnotator context: ${hint}. Use these exact object names.`;
+Keep segments contiguous and <=10 s. Do not drop any action that is in the
+description - every pick up, place, shift, pass must appear in the label,
+in the same order.`;
+  if (hint) ctx += `\nAnnotator context: ${hint}`;
   if (cfg.examples && cfg.examples.length)
     ctx += "\nMatch the style of these human-verified examples:" +
       cfg.examples.map((x) => `\nQA-APPROVED EXAMPLE from '${x.title}':\n` +
