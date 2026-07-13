@@ -1,6 +1,6 @@
 /* LabelDesk SPA - videos stay on the labeller's computer; only labels are stored. */
 "use strict";
-const APP_VER = "v4";
+const APP_VER = "v5";
 
 // ---------------------------------------------------------------- state & api
 const store = {
@@ -864,11 +864,18 @@ async function callClaude(cfg, hiSheets, stdSheets, duration, hint, objects = []
     const s = text.indexOf("{"), e2 = text.lastIndexOf("}");
     try { return JSON.parse(text.slice(s, e2 + 1)); }
     catch {
-      const m = text.match(/\{[^{}]*"label"[^{}]*\}/g) || [];
+      // salvage complete objects from a truncated reply
       const arr = [];
-      for (const o of m) { try { arr.push(JSON.parse(o)); } catch {} }
+      for (const re of [/\{[^{}]*"label"[^{}]*\}/g, /\{[^{}]*"actions"[^{}]*\}/g]) {
+        for (const o of (text.match(re) || [])) {
+          try { arr.push(JSON.parse(o)); } catch {}
+        }
+        if (arr.length) break;
+      }
       if (!arr.length) throw new Error("Claude reply could not be parsed - try again");
-      return { segments: arr };
+      // also try to salvage phases / hand_pattern text
+      const hp = (text.match(/"hand_pattern"\s*:\s*"([^"]{0,300})"/) || [])[1] || "";
+      return { segments: arr, hand_pattern: hp, phases: [] };
     }
   }
 
@@ -938,9 +945,19 @@ Return ONLY JSON:
   in order, naming which hand does each thing"}]}
 Segment rules: max 10 s each, cover 0.0 to ${duration.toFixed(1)} contiguously,
 boundaries where hands engage/disengage or goal changes, max 3 actions inside
-one segment - split if more. Watch to the very end - activities change.`,
-    hiSheets, 3500);
+one segment - split if more. Watch to the very end - activities change.
+Keep each "actions" description under 20 words so the full JSON fits.`,
+    hiSheets, 6000);
   assertFrames(s1, 1);
+  if ((s1 || "").trim().length < 40)
+    throw new Error("Stage 1 returned an empty reply - run the draft again.");
+  let s1obj;
+  try { s1obj = parseSegs(s1); } catch {
+    throw new Error("Stage 1 output was unreadable - run the draft again.");
+  }
+  const s1compact = JSON.stringify({
+    phases: s1obj.phases || [], hand_pattern: s1obj.hand_pattern || "",
+    segments: (s1obj.segments || []).slice(0, 40) });
 
   // ---- STAGE 2 (vision model, 2 fps): verify ORDER + hands against time
   el("msg").textContent = "Stage 2/3: verifying action order and hands at 2 fps…";
@@ -951,7 +968,12 @@ ${duration.toFixed(1)} s). Below is a draft analysis made from 1 fps frames.
 ${HANDRULE}
 ${OBJRULE}
 ${LENRULE}
-DRAFT:\n${s1}\n
+HAND EVIDENCE REQUIRED: for every action, decide the hand by checking which
+side of the frame that FOREARM enters from (lower-left = LEFT hand,
+lower-right = RIGHT hand) in the frames of that time range. Do not copy the
+draft's hand if the forearm evidence disagrees.
+DRAFT (from a first 1 fps viewing - may contain hand/order errors):
+${s1compact}
 Your job - verify every draft segment against these 2 fps frames:
 1. ORDER: are the actions inside each segment in the exact order they happen?
    Fix any wrong order.
@@ -962,16 +984,28 @@ Your job - verify every draft segment against these 2 fps frames:
 4. MISSED ACTIONS: ${ATOMRULE}
 Return ONLY JSON: {"segments":[{"start":0.0,"end":0.0,"actions":"corrected
 plain description, in order, with verified hands"}]}`,
-    stdSheets, 3500);
+    stdSheets, 6000);
   assertFrames(s2, 2);
+  if ((s2 || "").trim().length < 40)
+    throw new Error("Stage 2 (verification) returned an empty reply - " +
+      "run the draft again.");
+  let s2obj;
+  try { s2obj = parseSegs(s2); } catch {
+    throw new Error("Stage 2 output was unreadable - run the draft again.");
+  }
+  if (!(s2obj.segments || []).length || s2obj.segments.length < 3)
+    throw new Error("Stage 2 produced too few verified segments - " +
+      "run the draft again.");
+  const s2compact = JSON.stringify({ segments: s2obj.segments });
 
   // ---- STAGE 3 (text model, NO images): write SOP-grammar labels
   el("msg").textContent = "Stage 3/3: writing labels in client grammar…";
   let ctx =
 `Video length: EXACTLY ${duration.toFixed(1)} s. Below are verified segment
 descriptions from frame analysis (order and hands already checked - do NOT
-change hands, order, or timings; only rewrite wording into label grammar):
-${s2}
+change hands, order, or timings; only rewrite wording into label grammar.
+NEVER invent segments that are not in this list):
+${s2compact}
 ${OBJRULE}
 Convert each segment description into ONE label following every rule above.
 If a description contains more than 3 atomic actions, split that segment.
