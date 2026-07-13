@@ -98,6 +98,13 @@ function lint(raw){
   const l=/\bleft hand\b/.test(raw.toLowerCase()),r=/\bright hand\b/.test(raw.toLowerCase()),
         b=/\bboth hands\b/.test(raw.toLowerCase());
   if((l^r)&&!b)issues.push(["w","one hand only - what does other hand do?"]);
+  // 'and' may only join SAME-hand actions (client SOP)
+  const parts=raw.toLowerCase().split(/\s+and\s+/);
+  for(let k=1;k<parts.length;k++){
+    const h1=(parts[k-1].match(/\b(left|right|both)\b(?=\s+hands?)/g)||[]).pop();
+    const h2=(parts[k].match(/\b(left|right|both)\b(?=\s+hands?)/g)||[]).pop();
+    if(h1&&h2&&h1!==h2)issues.push(["e",
+      "'and' joins DIFFERENT hands ("+h1+"/"+h2+") - use comma between hands"]);}
   return issues;}
 const esc=t=>String(t??"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 const el=id=>document.getElementById(id);
@@ -130,10 +137,13 @@ taking:"take",bringing:"bring",moving:"shift",adjusting:"shift"};
 function quickFix(s){
   let t=" "+String(s||"").trim()+" ";
   t=t.toLowerCase();
+  t=t.replace(/&/g," and ");
   t=t.replace(/\s+/g," ");
   t=t.replace(/\b(the|a|an)\b/g," ");
   t=t.replace(/,\s*and\s+/g,", ");
-  t=t.replace(/\bwith (left|right) hands\b/g,"with $1 hand");
+  t=t.replace(/\b(left|right) hands\b/g,"$1 hand");
+  t=t.replace(/\b(by|from) (left|right|both) hands?\b/g,
+    (m,p,h)=>"with "+h+(h==="both"?" hands":" hand"));
   t=t.replace(/\b(left|right)-hand\b/g,"$1 hand");
   t=t.replace(/\bboth hand\b/g,"both hands");
   t=t.replace(/\bhands? free\b/g,"");
@@ -161,10 +171,13 @@ async function fixAll(){
   if(!lines.length){el("msg").textContent="Type at least one label.";return;}
   el("go").disabled=true;el("msg").textContent="Fixing with AI…";
   try{
-    const r=await fetch("/api/fix",{method:"POST",
+    const ctrl=new AbortController();
+    const timer=setTimeout(()=>ctrl.abort(),30000);
+    const r=await fetch("/api/fix",{method:"POST",signal:ctrl.signal,
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({passcode:localStorage.getItem("lf_pass"),
         lines,objects:el("objs").value.trim()})});
+    clearTimeout(timer);
     const j=await r.json();
     if(!r.ok||j.error){
       if(r.status===401){localStorage.removeItem("lf_pass");
@@ -174,7 +187,8 @@ async function fixAll(){
     render(lines,j.fixes||[]);
     el("msg").textContent="Done via "+(j.engine||"AI")+
       (j.costInr?(" (cost ~Rs "+j.costInr+")"):" (free)");
-  }catch(e){el("msg").textContent="Failed: "+e.message;}
+  }catch(e){el("msg").textContent="Failed: "+
+    (e.name==="AbortError"?"timed out after 30s - try again":e.message);}
   el("go").disabled=false;}
 function render(lines,fixes){
   const out=el("out");out.innerHTML="";
