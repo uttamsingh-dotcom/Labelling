@@ -77,7 +77,8 @@ async function askGemini(key, prompt) {
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: { response_mime_type: "application/json",
-          maxOutputTokens: 2500 },
+          maxOutputTokens: 2500,
+          thinkingConfig: { thinkingBudget: 0 } },
       }) });
   if (!r.ok) {
     const t = (await r.text()).slice(0, 200);
