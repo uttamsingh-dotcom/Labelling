@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LabelFix</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><text x='16' y='23' font-size='15' font-weight='800' font-family='Arial' fill='white' text-anchor='middle'>Lf</text></svg>">
+<style>
+:root{--ink:#0f172a;--mut:#64748b;--line:#e2e8f0;--brand:#4f46e5;
+--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI",system-ui,sans-serif;background:#f1f5f9;
+color:var(--ink);font-size:13.5px}
+header{background:#0f172a;color:#fff;padding:10px 14px;display:flex;
+align-items:center;gap:8px;font-weight:700}
+header .dot{width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:800}
+header .hint{margin-left:auto;font-weight:400;font-size:11px;color:#94a3b8}
+main{padding:12px;max-width:860px;margin:0 auto}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+textarea,input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
+font-size:13px;font-family:inherit}
+textarea:focus,input:focus{outline:2px solid #c7d2fe;border-color:var(--brand)}
+button{background:var(--brand);border:0;color:#fff;padding:8px 14px;border-radius:8px;
+font-size:13px;font-weight:600;cursor:pointer}
+button.ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.55}
+.hint{font-size:11.5px;color:var(--mut);line-height:1.5}
+.err{color:var(--bad)}
+.fixrow{border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:8px}
+.fixrow .orig{color:var(--mut);font-size:12px;text-decoration:line-through}
+.fixrow .fixed{font-size:14px;margin:4px 0;font-weight:600}
+.chip{padding:1px 8px;border-radius:10px;font-size:10.5px;font-weight:600;
+display:inline-block;margin:2px 3px 0 0}
+.chip.ok{background:#dcfce7;color:#166534}.chip.w{background:#fef3c7;color:#92400e}
+.chip.e{background:#fee2e2;color:#991b1b}
+.copy{float:right;font-size:11px;padding:3px 9px}
+</style>
+</head>
+<body>
+<header><span class="dot">Lf</span>LabelFix
+  <span class="hint">SOP label corrector &middot; you own the truth, it fixes the grammar</span></header>
+<main>
+  <div class="card" id="gate">
+    <p style="margin:0 0 8px"><b>Team passcode</b> (needed only for AI fix -
+    Quick fix works without it)</p>
+    <input id="pass" type="password" placeholder="Ask your admin for the passcode">
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button onclick="savePass()">Continue</button>
+      <button class="ghost" onclick="skipPass()">Skip - free Quick fix only</button>
+    </div>
+    <p class="hint" id="gatemsg"></p>
+  </div>
+
+  <div id="app" style="display:none">
+    <div class="card">
+      <p style="margin:0 0 6px"><b>Rough labels</b> - one per line, written after
+      watching the video. State hands, actions and objects; shorthand is fine.</p>
+      <textarea id="rough" rows="7" placeholder="left holds bun, right places veggies with tongs
+picks up chilli right hand plucks stem drops in bowl
+wipe screwdriver left hand cloth in right"></textarea>
+      <p style="margin:10px 0 6px"><b>Object names</b> (optional, comma separated -
+      exact names to use)</p>
+      <input id="objs" placeholder="e.g. bun, vegetables, tong">
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="ghost" onclick="quickFixAll()">&#9889; Quick fix (free, offline)</button>
+        <button id="go" onclick="fixAll()">&#10024; AI fix (rewrite)</button>
+        <span class="hint" id="msg"></span>
+      </div>
+      <p class="hint" style="margin-bottom:0">Quick fix: instant rule cleanup +
+      violation flags, costs nothing, works offline. AI fix: full rewrite into
+      SOP grammar (needs passcode; engine set by your admin).</p>
+    </div>
+    <div id="out"></div>
+  </div>
+</main>
+<script>
+"use strict";
+const FORBIDDEN=["the","a","an","it","them","they","adjust","adjusts","manipulate",
+"manipulates","move","moves","transfer","transfers","handover","give","gives","reach",
+"reaches","inspect","inspects","check","checks","examine","examines","tool","tools",
+"object","objects","utensil","utensils","cutlery","silverware"];
+const ING_OK=["string","ring","spring","wing","thing","earring","icing","ceiling","during"];
+function lint(raw){
+  const issues=[];raw=(raw||"").trim();
+  if(!raw)return issues;
+  const words=raw.toLowerCase().replace(/,/g," ").split(/\s+/).filter(Boolean);
+  if(words.length>20)issues.push(["e",words.length+" words (max 20)"]);
+  for(const w of words){
+    if(FORBIDDEN.includes(w))issues.push(["e",'forbidden: "'+w+'"']);
+    else if(w.endsWith("ing")&&!ING_OK.includes(w))issues.push(["e",'-ing: "'+w+'"']);}
+  if(!/\bhand(s)?\b/.test(raw.toLowerCase()))issues.push(["e","no hand stated"]);
+  const seps=(raw.match(/,/g)||[]).length+(raw.toLowerCase().match(/\band\b/g)||[]).length;
+  if(seps>2)issues.push(["e",seps+" separators (max 2)"]);
+  const holds=(raw.toLowerCase().match(/\bhold\b/g)||[]).length;
+  if(holds>=2)issues.push(["w","two holds - name the active hand's real action"]);
+  const l=/\bleft hand\b/.test(raw.toLowerCase()),r=/\bright hand\b/.test(raw.toLowerCase()),
+        b=/\bboth hands\b/.test(raw.toLowerCase());
+  if((l^r)&&!b)issues.push(["w","one hand only - what does other hand do?"]);
+  return issues;}
+const esc=t=>String(t??"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
+const el=id=>document.getElementById(id);
+
+function savePass(){
+  const p=el("pass").value.trim();
+  if(!p){el("gatemsg").textContent="Enter the passcode.";return;}
+  localStorage.setItem("lf_pass",p);boot();}
+function skipPass(){localStorage.setItem("lf_pass","__SKIP__");boot();}
+function boot(){
+  if(localStorage.getItem("lf_pass")){
+    el("gate").style.display="none";el("app").style.display="";}
+}
+
+/* ---------- Quick fix: pure rules, zero API ---------- */
+const ING_MAP={holding:"hold",wiping:"wipe",picking:"pick",placing:"place",
+putting:"put",cutting:"cut",rotating:"rotate",folding:"fold",plucking:"pluck",
+pouring:"pour",stirring:"stir",scooping:"scoop",passing:"pass",shifting:"shift",
+flipping:"flip",turning:"turn",arranging:"arrange",packing:"pack",
+pressing:"press",opening:"open",closing:"close",cleaning:"clean",
+scrubbing:"scrub",wrapping:"wrap",attaching:"attach",spreading:"spread",
+dipping:"dip",sweeping:"sweep",ironing:"iron",smoothing:"smooth",
+squeezing:"squeeze",grabbing:"grab",lifting:"lift",dropping:"drop",
+tearing:"tear",pushing:"push",pulling:"pull",twisting:"twist",peeling:"peel",
+slicing:"slice",washing:"wash",rinsing:"rinse",drying:"dry",loading:"load",
+removing:"remove",inserting:"insert",releasing:"release",tapping:"tap",
+rolling:"roll",sealing:"seal",filling:"fill",stacking:"stack",sorting:"sort",
+aligning:"align",repositioning:"reposition",straightening:"straighten",
+taking:"take",bringing:"bring",moving:"shift",adjusting:"shift"};
+function quickFix(s){
+  let t=" "+String(s||"").trim()+" ";
+  t=t.toLowerCase();
+  t=t.replace(/\s+/g," ");
+  t=t.replace(/\b(the|a|an)\b/g," ");
+  t=t.replace(/,\s*and\s+/g,", ");
+  t=t.replace(/\bwith (left|right) hands\b/g,"with $1 hand");
+  t=t.replace(/\b(left|right)-hand\b/g,"$1 hand");
+  t=t.replace(/\bboth hand\b/g,"both hands");
+  t=t.replace(/\bhands? free\b/g,"");
+  t=t.split(" ").map(w=>{
+    const bare=w.replace(/[^a-z]/g,"");
+    if(ING_MAP[bare])return w.replace(bare,ING_MAP[bare]);
+    return w;}).join(" ");
+  t=t.replace(/\s+,/g,",").replace(/\s+/g," ").trim();
+  t=t.replace(/,\s*$/,"").replace(/^\s*,/,"");
+  return t;}
+function quickFixAll(){
+  const lines=el("rough").value.split("\n").map(s=>s.trim()).filter(Boolean);
+  if(!lines.length){el("msg").textContent="Type at least one label.";return;}
+  const fixes=lines.map((s,i)=>({i,fixed:quickFix(s),flags:[]}));
+  render(lines,fixes);
+  el("msg").textContent="Quick fix done (free) - red/amber chips show what still needs a human.";}
+
+async function fixAll(){
+  let pass=localStorage.getItem("lf_pass");
+  if(!pass||pass==="__SKIP__"){
+    pass=prompt("AI fix needs the team passcode:")||"";
+    if(!pass)return;
+    localStorage.setItem("lf_pass",pass);}
+  const lines=el("rough").value.split("\n").map(s=>s.trim()).filter(Boolean);
+  if(!lines.length){el("msg").textContent="Type at least one label.";return;}
+  el("go").disabled=true;el("msg").textContent="Fixing with AI…";
+  try{
+    const r=await fetch("/api/fix",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({passcode:localStorage.getItem("lf_pass"),
+        lines,objects:el("objs").value.trim()})});
+    const j=await r.json();
+    if(!r.ok||j.error){
+      if(r.status===401){localStorage.removeItem("lf_pass");
+        el("gate").style.display="";el("app").style.display="none";
+        el("gatemsg").textContent="Wrong passcode - try again.";return;}
+      throw new Error(j.error||("HTTP "+r.status));}
+    render(lines,j.fixes||[]);
+    el("msg").textContent="Done via "+(j.engine||"AI")+
+      (j.costInr?(" (cost ~Rs "+j.costInr+")"):" (free)");
+  }catch(e){el("msg").textContent="Failed: "+e.message;}
+  el("go").disabled=false;}
+function render(lines,fixes){
+  const out=el("out");out.innerHTML="";
+  const byI={};for(const f of fixes)byI[f.i]=f;
+  lines.forEach((orig,i)=>{
+    const f=byI[i]||{fixed:"(no fix returned)"};
+    const issues=lint(f.fixed);
+    const chips=issues.length?issues.map(x=>
+      `<span class="chip ${x[0]}">${esc(x[1])}</span>`).join("")
+      :'<span class="chip ok">&#10003; passes all checks</span>';
+    const flags=(f.flags||[]).map(x=>
+      `<span class="chip w">flag: ${esc(x)}</span>`).join("");
+    out.innerHTML+=`<div class="fixrow">
+      <button class="ghost copy" onclick="navigator.clipboard.writeText(${JSON.stringify(f.fixed)
+        .replace(/"/g,"&quot;")});this.textContent='copied!'">copy</button>
+      <div class="orig">${esc(orig)}</div>
+      <div class="fixed">${esc(f.fixed)}</div>
+      ${f.split?`<div class="hint">split suggested: ${esc(f.split)}</div>`:""}
+      <div>${chips}${flags}</div></div>`;});
+}
+el("pass").addEventListener("keydown",e=>{if(e.key==="Enter")savePass();});
+boot();
+</script>
+</body>
+</html>
