@@ -29,11 +29,24 @@ LABEL RULES:
 - If a line contains MORE than 3 atomic actions, split it into two labels and
   put the second label in the split field.
 
+VERB CORRECTION (important): keep WHAT physically happened exactly as the
+annotator described, but NAME it with the precise SOP verb that fits the
+object and activity:
+- clean/rub with cloth -> wipe;  clean with brush -> scrub
+- move/relocate on a surface -> shift;  put/set/drop down -> place
+- grab/take/lift off a surface -> pick up;  hand to other hand -> pass
+- turn over -> flip;  turn around -> rotate or turn
+Never invent an action that was not described; never delete one; only choose
+the correct verb for it.
+
 CLIENT AUDIT LESSONS:
 - Never write 'hold X' when that hand is actively doing something else the
   annotator described - name the real action.
 - Keep micro-actions the annotator wrote: shift, pass, pick up, place, pour,
   scoop, flip, turn, wipe.
+
+FINAL CHECK before returning: scan every output label once more - zero
+forbidden words, zero -ing verb forms, correct SOP verbs, hands untouched.
 
 Return ONLY JSON:
 {"fixes":[{"i":0,"fixed":"...","split":"","flags":[]}]}
@@ -63,11 +76,73 @@ export async function handler(event) {
   const prompt = RULES + "\n" + ctx;
 
   try {
-    const out = gKey ? await askGemini(gKey, prompt) : await askClaude(cKey, prompt);
+    const ask = (p) => gKey ? askGemini(gKey, p) : askClaude(cKey, p);
+    const out = await ask(prompt);
+    out.fixes = (out.fixes || []).map((f) => ({ ...f,
+      fixed: postClean(f.fixed), split: f.split ? postClean(f.split) : "" }));
+    // if any output STILL contains a forbidden word, one automatic repair pass
+    const bad = out.fixes.filter((f) => violations(f.fixed).length ||
+      (f.split && violations(f.split).length));
+    if (bad.length) {
+      const rep = await ask(RULES +
+        "\nThese outputs still violate the rules. Rewrite ONLY these, same " +
+        "index i, removing every violation listed, changing nothing else:\n" +
+        bad.map((f) => `${f.i}: "${f.fixed}" (violations: ${
+          violations(f.fixed).join(", ")})`).join("\n"));
+      for (const r2 of (rep.fixes || [])) {
+        const t = out.fixes.find((f) => f.i === r2.i);
+        if (t && r2.fixed) t.fixed = postClean(r2.fixed);
+      }
+      if (rep.costInr) out.costInr = +((out.costInr || 0) + rep.costInr).toFixed(2);
+    }
     return resp(200, out);
   } catch (e) {
     return resp(502, { error: String(e.message || e).slice(0, 300) });
   }
+}
+
+// ---------- mechanical output enforcement ----------
+const BAD_WORDS = ["the","a","an","it","them","they","adjust","adjusts",
+"move","moves","manipulate","manipulates","transfer","transfers","handover","give","gives",
+"reach","reaches","inspect","inspects","check","checks","examine","examines",
+"tool","tools","object","objects","utensil","utensils","cutlery","silverware"];
+const ING_OK = ["string","ring","spring","wing","thing","earring","icing",
+"ceiling","during"];
+const ING_MAP = {holding:"hold",wiping:"wipe",picking:"pick",placing:"place",
+putting:"put",cutting:"cut",rotating:"rotate",folding:"fold",plucking:"pluck",
+pouring:"pour",stirring:"stir",scooping:"scoop",passing:"pass",shifting:"shift",
+flipping:"flip",turning:"turn",arranging:"arrange",packing:"pack",
+pressing:"press",opening:"open",closing:"close",cleaning:"clean",
+scrubbing:"scrub",wrapping:"wrap",attaching:"attach",spreading:"spread",
+dipping:"dip",sweeping:"sweep",ironing:"iron",smoothing:"smooth",
+squeezing:"squeeze",grabbing:"grab",lifting:"lift",dropping:"drop",
+tearing:"tear",pushing:"push",pulling:"pull",twisting:"twist",peeling:"peel",
+slicing:"slice",washing:"wash",rinsing:"rinse",drying:"dry",loading:"load",
+removing:"remove",inserting:"insert",releasing:"release",tapping:"tap",
+rolling:"roll",sealing:"seal",filling:"fill",stacking:"stack",sorting:"sort",
+aligning:"align",repositioning:"reposition",straightening:"straighten",
+moving:"shift"};
+function postClean(s) {
+  let t = " " + String(s || "").trim() + " ";
+  t = t.toLowerCase().replace(/&/g, " and ").replace(/\s+/g, " ");
+  t = t.replace(/\b(the|a|an)\b/g, " ");
+  t = t.split(" ").map((w) => {
+    const bare = w.replace(/[^a-z]/g, "");
+    if (ING_MAP[bare]) return w.replace(bare, ING_MAP[bare]);
+    return w;
+  }).join(" ");
+  t = t.replace(/\s+,/g, ",").replace(/\s+/g, " ").trim();
+  return t.replace(/,\s*$/, "").replace(/^\s*,/, "");
+}
+function violations(s) {
+  const out = [];
+  const words = String(s || "").toLowerCase().replace(/,/g, " ")
+    .split(/\s+/).filter(Boolean);
+  for (const w of words) {
+    if (BAD_WORDS.includes(w)) out.push(w);
+    else if (w.endsWith("ing") && !ING_OK.includes(w) && !ING_MAP[w]) out.push(w);
+  }
+  return [...new Set(out)];
 }
 
 async function askGemini(key, prompt) {
